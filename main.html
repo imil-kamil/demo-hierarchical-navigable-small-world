@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DEMO HNSW (SEARCH)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <style>
+    /* Tata letak dasar halaman */
+    body {
+      margin: 0;
+      overflow: hidden; 
+      background: #e0ffff;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      flex-direction: column;
+      gap: 10px;
+      font-family: sans-serif;
+    }
+
+    /* Panel kontrol di kiri-atas */
+    #control-panel {
+      position: absolute;
+      top: 30px;
+      left: 20px;
+      width: 180px;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      background: rgba(255, 255, 255, 0.35);
+      padding: 12px;
+      border-radius: 12px;
+      backdrop-filter: blur(6px);
+      font-size: 14px;
+      color: #003366;
+      box-shadow: 0 0 10px rgba(255, 255, 255, 0.4);
+      gap: 8px;
+    }
+
+    /* Tombol */
+    button {
+      padding: 8px 12px;
+      border: none;
+      background: #1e90ff;
+      color: white;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      width: 120%;
+    }
+    button:hover { background: #187bcd; }
+
+    /* Visual tambahan untuk tombol non-aktif */
+    button:disabled {
+      opacity: 0.45;
+      filter: grayscale(45%);
+      cursor: default;
+    }
+
+    /* Info teks di panel */
+    #info {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #003366;
+      text-align: left;
+    }
+
+    /* Kursor saat drag */
+    body.grabbing { cursor: grabbing; }
+  </style>
+</head>
+
+<body>
+  <div id="control-panel">
+    <div>Jumlah Layer : <span id="layerCount">0</span></div>
+    <button id="generateNodes">Buat 14 Node Acak</button>
+    <button id="buildLayer" disabled>Bangun Layer</button>
+    <button id="buildNetwork" disabled>Bangun Jaringan</button>
+    <button id="viewTopLayer" disabled>Set Entry Point di Top Layer</button>
+    <button id="view2D" disabled>Set Query di Base Layer</button>
+    <button id="startTraversal" disabled>Mulai Traversal</button>
+    <button id="resetTraversal" disabled>Reset Traversal</button>
+    <div id="info">Informasi : -</div>
+  </div>
+
+  <script>
+    // ======================
+    // Konfigurasi dan state
+    // ======================
+    let scene, camera, renderer, cube;
+
+    let topLayerSelectedNodeIndex = null;
+    let queryPosition = null;
+    let traversalPath = [];
+    let traversalRunning = false;
+    let traversalStep = 0;
+    let entryHighlighted = false;
+
+    let currentOutlineHighlight = null;
+
+    const BORDER_COLOR = 0xC0392B;
+    const BORDER_OPACITY = 0.7;
+    const hexToCss = n => "#" + n.toString(16).padStart(6, "0");
+
+    let radius = 6;
+    let theta = Math.PI / 2;
+    let phi = Math.PI / 3;
+    const ROTATION_SPEED = 0.005;
+
+    const layerGap = 0.45;
+    const FIXED_CUBE_HEIGHT = 5 * layerGap;
+    const LAYER_SIZE = 1.6;
+    const SCALE = 300;
+    const EPSILON = 1e-5;
+
+    const theme = {
+      bg: 0xe0ffff,
+      cube: 0x87cefa,
+      edge: 0x1e90ff,
+      cubeOpacity: 0.25,
+      floorOpacity: 0.15,
+      outline: 0x1e90ff
+    };
+
+    const colorPalette = [
+      0xff0000,0xff7f00,0xffff00,0x7fff00,0x00ff00,0x00ff7f,
+      0x00ffff,0x007fff,0x0000ff,0x7f00ff,0xff00ff,0xff007f,
+      0x999999,0x222222
+    ];
+
+    let floorGroup = new THREE.Group();
+    let nodeGroup  = new THREE.Group();
+    let networkGroup = new THREE.Group();
+
+    let basePositions = [];
+    let promotedLayers = [];
+    let layerCount = 0;
+
+    const NODE_RADIUS = 0.05;
+    const GAP_MARGIN = 0.005;
+
+    const HIGHLIGHT_OFFSET = 0.01;
+    const HIGHLIGHT_SCALE = 1.1;
+    const OUTLINE_SCALE_MULT = 1.35;
+
+    const MAX_LAYER = 5;
+    let networkBuilt = false;
+
+    // New flags
+    let traversalReachedQuery = false; // true when traversal reached query
+    let traversalStarted = false;      // true once traversal was started at least once
+
+    // ======================
+    // Utility & camera
+    // ======================
+    function updateCamera() {
+      camera.position.x = radius * Math.sin(phi) * Math.sin(theta);
+      camera.position.y = radius * Math.cos(phi);
+      camera.position.z = radius * Math.sin(phi) * Math.cos(theta);
+      camera.lookAt(0,0,0);
+    }
+
+    // ======================
+    // Buttons logic
+    // ======================
+    function isTraversalAtQuery() {
+      if (!traversalPath || traversalPath.length === 0) return false;
+      const last = traversalPath[traversalPath.length - 1];
+      if (last && last.to === "query" && traversalStep >= traversalPath.length) return true;
+      return false;
+    }
+
+    function updateButtons() {
+      const btnGenerate = document.getElementById("generateNodes");
+      const btnBuildLayer = document.getElementById("buildLayer");
+      const btnBuildNetwork = document.getElementById("buildNetwork");
+      const btnView2D = document.getElementById("view2D");
+      const btnViewTop = document.getElementById("viewTopLayer");
+      const btnStart = document.getElementById("startTraversal");
+      const btnReset = document.getElementById("resetTraversal");
+
+      // generate selalu aktif
+      btnGenerate.disabled = false;
+
+      // buildLayer aktif bila ada minimal 1 layer dan belum mencapai MAX_LAYER
+      btnBuildLayer.disabled = !(layerCount >= 1 && layerCount < MAX_LAYER);
+
+      // buildNetwork aktif hanya ketika layerCount >= MAX_LAYER dan network belum dibangun
+      btnBuildNetwork.disabled = !(layerCount >= MAX_LAYER && !networkBuilt);
+
+      // view2D & viewTopLayer aktif hanya bila network sudah dibangun AND traversal belum membekukan pemilihan
+      // pembekuan terjadi saat traversalStarted true (ketika user mulai traversal) atau traversalReachedQuery true
+      const viewsAllowed = networkBuilt && !traversalStarted && !traversalReachedQuery;
+      btnView2D.disabled = !viewsAllowed;
+      btnViewTop.disabled = !viewsAllowed;
+
+      // startTraversal aktif hanya bila entry & query ditetapkan dan networkBuilt, dan belum mencapai query
+      const entrySet = topLayerSelectedNodeIndex !== null && topLayerSelectedNodeIndex !== undefined;
+      const querySet = queryPosition !== null && queryPosition !== undefined;
+      btnStart.disabled = !(networkBuilt && entrySet && querySet && !isTraversalAtQuery());
+
+      // resetTraversal aktif bila traversal pernah dihitung atau sedang berjalan atau traversalReachedQuery true
+      btnReset.disabled = !( (traversalPath && traversalPath.length > 0) || traversalRunning || traversalReachedQuery || traversalStarted );
+    }
+
+    function updateInfo(msg) {
+      document.getElementById("info").textContent = "Info: " + msg;
+    }
+
+    // ======================
+    // Scene init
+    // ======================
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(theme.bg);
+
+      camera = new THREE.PerspectiveCamera(33, innerWidth / innerHeight, 0.1, 1000);
+      updateCamera();
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(innerWidth, innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+      scene.add(ambient);
+
+      const edgeMat = new THREE.LineBasicMaterial({ color: theme.edge, transparent: true, opacity: 0.9 });
+      const edgeLines = new THREE.Group();
+      edgeLines.visible = false;
+      const verts = [
+        [-0.5,-0.5,-0.5],[0.5,-0.5,-0.5],[0.5,-0.5,0.5],[-0.5,-0.5,0.5],
+        [-0.5,0.5,-0.5],[0.5,0.5,-0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]
+      ];
+      const verticalEdges = [[0,4],[1,5],[2,6],[3,7]];
+      verticalEdges.forEach(([a,b]) => {
+        const pts = [new THREE.Vector3(...verts[a]), new THREE.Vector3(...verts[b])];
+        edgeLines.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), edgeMat));
+      });
+
+      cube = new THREE.Group();
+      cube.add(edgeLines);
+      cube.scale.y = FIXED_CUBE_HEIGHT;
+
+      scene.add(cube);
+      scene.add(floorGroup);
+      scene.add(nodeGroup);
+      scene.add(networkGroup);
+
+      theta -= Math.PI / 2;
+      updateCamera();
+
+      addEvents();
+    }
+
+    // ======================
+    // Floors & base positions
+    // ======================
+    function addFloors(count) {
+      floorGroup.clear();
+      const height = FIXED_CUBE_HEIGHT;
+      const floorSize = LAYER_SIZE;
+      for (let i = 0; i < count; i++) {
+        const floorMat = new THREE.MeshBasicMaterial({
+          color: theme.cube,
+          transparent: true,
+          opacity: theme.floorOpacity,
+          side: THREE.DoubleSide,
+          depthWrite: false
+        });
+        const floorGeo = new THREE.PlaneGeometry(floorSize, floorSize);
+        const plane = new THREE.Mesh(floorGeo, floorMat);
+        plane.rotation.x = -Math.PI / 2;
+        plane.position.y = -0.5 * height + (i + 0.5) * layerGap;
+        floorGroup.add(plane);
+
+        const edgeGeo = new THREE.EdgesGeometry(floorGeo);
+        const edgeLine = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({
+          color: BORDER_COLOR, transparent: true, opacity: BORDER_OPACITY, depthWrite: false
+        }));
+        edgeLine.rotation.x = -Math.PI / 2;
+        edgeLine.position.copy(plane.position);
+        floorGroup.add(edgeLine);
+      }
+    }
+
+    function buildBasePositions(nodeCount = 14, layerSize = LAYER_SIZE) {
+      basePositions = [];
+      const half = layerSize * 0.5;
+      const minDist = layerSize * 0.08;
+      const maxAttempts = 5000;
+      let attempts = 0;
+
+      while (basePositions.length < nodeCount && attempts < maxAttempts) {
+        const x = (Math.random() * 2 - 1) * half;
+        const y = (Math.random() * 2 - 1) * half;
+        let tooClose = false;
+        for (const p of basePositions) {
+          const dx = x - p.x, dy = y - p.y;
+          if (dx*dx + dy*dy < minDist * minDist) { tooClose = true; break; }
+        }
+        if (!tooClose) basePositions.push({ x, y });
+        attempts++;
+      }
+    }
+
+    // ======================
+    // Generate base nodes
+    // ======================
+    function generateBaseNodes() {
+      floorGroup.clear();
+      nodeGroup.clear();
+      networkGroup.clear();
+      promotedLayers = [];
+      basePositions = [];
+      layerCount = 0;
+      topLayerSelectedNodeIndex = null;
+      queryPosition = null;
+      traversalPath = [];
+      traversalRunning = false;
+      traversalStep = 0;
+      entryHighlighted = false;
+      networkBuilt = false;
+      traversalReachedQuery = false;
+      traversalStarted = false;
+
+      document.getElementById("layerCount").textContent = 0;
+
+      buildBasePositions(14, LAYER_SIZE);
+
+      promotedLayers = [ Array.from({ length: basePositions.length }, (_, i) => i) ];
+      layerCount = 1;
+      document.getElementById("layerCount").textContent = layerCount;
+
+      rebuildNodeGroup();
+      addFloors(layerCount);
+
+      updateButtons();
+      updateInfo("Base layer dibuat dengan node yang tersebar secara acak.");
+    }
+
+    // ======================
+    // Build next layer
+    // ======================
+    function buildNextLayer() {
+      const prevLayer = promotedLayers[promotedLayers.length - 1];
+      let newLayer = [];
+      let attempts = 0;
+      const maxAttempts = 20;
+
+      do {
+        newLayer = prevLayer.filter(() => Math.random() < 0.5);
+        attempts++;
+      } while (newLayer.length <= 1 && attempts < maxAttempts);
+
+      if (newLayer.length <= 1) {
+        updateInfo("Layer tertinggi tinggal 1 node. Pembangunan dihentikan!");
+        updateButtons();
+        return;
+      }
+
+      promotedLayers.push(newLayer);
+      layerCount = promotedLayers.length;
+      document.getElementById("layerCount").textContent = layerCount;
+      updateInfo(`Layer baru dibuat dengan ${newLayer.length} node.`);
+      addFloors(layerCount);
+      rebuildNodeGroup();
+
+      if (newLayer.length === 2) {
+        updateInfo("Layer paling atas sudah tersisa 2 node. ");
+      }
+
+      if (layerCount >= MAX_LAYER) {
+        updateInfo("Telah mencapai batasan layer maksimum (5 layer).");
+      }
+      updateButtons();
+    }
+
+    // ======================
+    // Rebuild node visuals
+    // ======================
+    function rebuildNodeGroup() {
+      nodeGroup.clear();
+      if (basePositions.length === 0) return;
+      const height = FIXED_CUBE_HEIGHT;
+      const circleSegments = 48;
+
+      for (let i = 0; i < layerCount; i++) {
+        const y = -0.5 * height + (i + 0.5) * layerGap;
+        const nodes = promotedLayers[i];
+        nodes.forEach(idx => {
+          const pos = basePositions[idx];
+          const color = colorPalette[idx % colorPalette.length];
+          const geom = new THREE.CircleGeometry(NODE_RADIUS, circleSegments);
+          const mat = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide });
+          mat.depthWrite = true;
+          const circle = new THREE.Mesh(geom, mat);
+          circle.rotation.x = -Math.PI / 2;
+          circle.position.set(pos.x, y, pos.y);
+          circle.userData = { idx, layer: i };
+          circle.renderOrder = 2;
+          nodeGroup.add(circle);
+
+          const outlineGeom = new THREE.EdgesGeometry(geom);
+          const outlineMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 });
+          const outline = new THREE.LineSegments(outlineGeom, outlineMat);
+          outline.rotation.x = -Math.PI / 2;
+          outline.position.set(pos.x, y + 0.0001, pos.y);
+          outline.renderOrder = 3;
+          nodeGroup.add(outline);
+
+          if (i === layerCount - 1 && idx === topLayerSelectedNodeIndex) {
+            circle.userData.isTopSelected = true;
+          }
+        });
+      }
+
+      if (queryPosition) {
+        const y = -0.5 * height + 0.5 * layerGap;
+        const geom = new THREE.CircleGeometry(NODE_RADIUS * 1.2, circleSegments);
+        const mat = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide });
+        mat.depthWrite = true;
+        const circle = new THREE.Mesh(geom, mat);
+        circle.rotation.x = -Math.PI / 2;
+        circle.position.set(queryPosition.x, y, queryPosition.y);
+        circle.userData = { idx: "query" };
+        circle.renderOrder = 2;
+        nodeGroup.add(circle);
+      }
+
+      if (entryHighlighted && topLayerSelectedNodeIndex !== null && topLayerSelectedNodeIndex !== undefined) {
+        highlightEntryNode();
+      }
+
+      updateInfo("Layer baru dibuat dengan sistem promosi node.");
+    }
+
+    // ======================
+    // Highlight helpers
+    // ======================
+    function createOutlineAt(x, y, z) {
+      clearOutline();
+      const outlineRadius = NODE_RADIUS * HIGHLIGHT_SCALE * OUTLINE_SCALE_MULT;
+      const circleGeom = new THREE.CircleGeometry(outlineRadius, 64);
+      const edgesGeom = new THREE.EdgesGeometry(circleGeom);
+      const outlineMat = new THREE.LineBasicMaterial({ color: BORDER_COLOR, transparent: true, opacity: 1.0 });
+      const outlineMesh = new THREE.LineSegments(edgesGeom, outlineMat);
+      outlineMesh.rotation.x = -Math.PI / 2;
+      outlineMesh.position.set(x, y + HIGHLIGHT_OFFSET + 0.00025, z);
+      outlineMesh.renderOrder = 5;
+      outlineMesh.userData = { traversalOutline: true };
+      currentOutlineHighlight = outlineMesh;
+      nodeGroup.add(outlineMesh);
+      try { circleGeom.dispose(); } catch {}
+    }
+
+    function clearOutline() {
+      if (currentOutlineHighlight) {
+        nodeGroup.remove(currentOutlineHighlight);
+        try { currentOutlineHighlight.geometry.dispose(); } catch {}
+        try { currentOutlineHighlight.material.dispose(); } catch {}
+        currentOutlineHighlight = null;
+      }
+    }
+
+    function highlightEntryNode() {
+      if (topLayerSelectedNodeIndex === null || topLayerSelectedNodeIndex === undefined) return;
+      const layerTopIndex = promotedLayers.length - 1;
+      const nodeMesh = nodeGroup.children.find(n => n.userData && n.userData.idx === topLayerSelectedNodeIndex && n.userData.layer === layerTopIndex && n.type === "Mesh");
+      if (nodeMesh) {
+        const pos = nodeMesh.position;
+        clearOutline();
+        createOutlineAt(pos.x, pos.y, pos.z);
+        entryHighlighted = true;
+      } else {
+        const p = basePositions[topLayerSelectedNodeIndex];
+        if (!p) return;
+        const y = -0.5 * FIXED_CUBE_HEIGHT + (layerTopIndex + 0.5) * layerGap;
+        clearOutline();
+        createOutlineAt(p.x, y, p.y);
+        entryHighlighted = true;
+      }
+      checkTraversalReady();
+      updateButtons();
+    }
+
+    // ======================
+    // Build network
+    // ======================
+    function buildNetwork() {
+      networkGroup.clear();
+      const height = FIXED_CUBE_HEIGHT;
+      const Mmax = 8;
+      const Mmax0 = 5;
+      const layerColors = [0x4B4B4B, 0xC0392B, 0xF39C12, 0x7D3C98, 0x2C3E50];
+
+      for (let i = 0; i < promotedLayers.length; i++) {
+        const y = -0.5 * height + (i + 0.5) * layerGap;
+        const nodes = promotedLayers[i];
+        const K = (i === 0) ? Mmax : Mmax0;
+        const layerColor = new THREE.Color(layerColors[i % layerColors.length]);
+
+        for (let a = 0; a < nodes.length; a++) {
+          const idxA = nodes[a];
+          const posA = basePositions[idxA];
+          const neighbors = nodes
+            .filter(idxB => idxB !== idxA)
+            .map(idxB => ({ idx: idxB, dist: Math.hypot(basePositions[idxB].x - posA.x, basePositions[idxB].y - posA.y) }))
+            .sort((a, b) => a.dist - b.dist)
+            .slice(0, K);
+
+          neighbors.forEach(({ idx }) => {
+            const posB = basePositions[idx];
+            const A = new THREE.Vector3(posA.x, y, posA.y);
+            const B = new THREE.Vector3(posB.x, y, posB.y);
+            const dir = new THREE.Vector3().subVectors(B, A);
+            const dist = dir.length();
+            if (dist <= 1e-6) return;
+            dir.normalize();
+
+            const shorten = NODE_RADIUS + GAP_MARGIN;
+            const maxShort = Math.min(shorten, Math.max(0, dist / 2 - 1e-6));
+            const newA = A.clone().add(dir.clone().multiplyScalar(maxShort));
+            const newB = B.clone().add(dir.clone().multiplyScalar(-maxShort));
+
+            const geom = new THREE.BufferGeometry().setFromPoints([ newA, newB ]);
+            const lineMat = new THREE.LineBasicMaterial({
+              color: layerColor,
+              transparent: true,
+              opacity: 0.9,
+              linewidth: 2,
+              depthWrite: false
+            });
+            const line = new THREE.Line(geom, lineMat);
+            line.userData = { layer: i, from: idxA, to: idx };
+            line.renderOrder = 1;
+            networkGroup.add(line);
+          });
+        }
+
+        if (i < promotedLayers.length - 1) {
+          const nextNodes = promotedLayers[i + 1];
+          nextNodes.forEach(idxNext => {
+            if (nodes.includes(idxNext)) {
+              const pos = basePositions[idxNext];
+              const pos1 = new THREE.Vector3(pos.x, y, pos.y);
+              const pos2 = new THREE.Vector3(pos.x, y + layerGap, pos.y);
+              const geom = new THREE.BufferGeometry().setFromPoints([pos1, pos2]);
+              const verticalColor = new THREE.Color(BORDER_COLOR).clone().offsetHSL(0, 0, +0.08);
+              const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: verticalColor, transparent: true, opacity: BORDER_OPACITY }));
+              line.userData = { layer: i, from: idxNext, to: idxNext };
+              line.renderOrder = 1;
+              networkGroup.add(line);
+            }
+          });
+        }
+      }
+
+      networkBuilt = true;
+      updateInfo("Visualisasi jaringan HNSW berhasil dibangun (horisontal dan vertikal).");
+      updateButtons();
+    }
+
+    // ======================
+    // Compute traversal path
+    // ======================
+    function computeTraversalPath(entryIdx, queryPos) {
+      if (entryIdx === null || entryIdx === undefined || !queryPos) return [];
+      const dist2D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+      const layerNeighborMap = promotedLayers.map(() => ({}));
+      networkGroup.children.forEach(line => {
+        if (!line.userData) return;
+        const l = line.userData.layer, from = line.userData.from, to = line.userData.to;
+        if (l === undefined || from === undefined || to === undefined) return;
+        if (!layerNeighborMap[l][from]) layerNeighborMap[l][from] = new Set();
+        if (!layerNeighborMap[l][to]) layerNeighborMap[l][to] = new Set();
+        layerNeighborMap[l][from].add(to);
+        layerNeighborMap[l][to].add(from);
+      });
+
+      const path = [];
+      let current = entryIdx;
+
+      for (let l = promotedLayers.length - 1; l >= 1; l--) {
+        let improved = true;
+        while (improved) {
+          improved = false;
+          const neighbors = layerNeighborMap[l][current] ? Array.from(layerNeighborMap[l][current]) : [];
+          let best = current;
+          let bestD = dist2D(basePositions[current], queryPos);
+          for (const n of neighbors) {
+            if (!promotedLayers[l].includes(n)) continue;
+            const d = dist2D(basePositions[n], queryPos);
+            if (d < bestD) { bestD = d; best = n; improved = true; }
+          }
+          if (improved && best !== current) { path.push({ from: current, to: best, layer: l }); current = best; }
+        }
+
+        if (promotedLayers[l - 1].includes(current)) {
+          path.push({ from: current, to: current, layer: l - 1 });
+        } else {
+          const lowerLayer = promotedLayers[l - 1];
+          let closestIdx = null, closestD = Infinity;
+          for (const idx of lowerLayer) {
+            const d = dist2D(basePositions[idx], basePositions[current]);
+            if (d < closestD) { closestD = d; closestIdx = idx; }
+          }
+          if (closestIdx !== null) { path.push({ from: current, to: closestIdx, layer: l - 1 }); current = closestIdx; }
+        }
+      }
+
+      const efSearch = 8;
+      const pq = [];
+      const inQueue = new Set();
+      const expanded = new Set();
+
+      const pushIfNew = (idx) => {
+        if (inQueue.has(idx)) return;
+        inQueue.add(idx);
+        pq.push({ idx, d: dist2D(basePositions[idx], queryPos) });
+      };
+
+      pushIfNew(current);
+      let best = { idx: current, d: dist2D(basePositions[current], queryPos) };
+
+      while (pq.length > 0) {
+        pq.sort((a, b) => a.d - b.d);
+        const node = pq.shift();
+        const nodeIdx = node.idx;
+
+        if (expanded.has(nodeIdx)) continue;
+        expanded.add(nodeIdx);
+
+        if (node.d < best.d) best = node;
+        if (expanded.size >= efSearch) break;
+
+        const neighbors0 = layerNeighborMap[0][nodeIdx] ? Array.from(layerNeighborMap[0][nodeIdx]) : [];
+        for (const n of neighbors0) {
+          if (!promotedLayers[0].includes(n)) continue;
+          if (expanded.has(n)) continue;
+          pushIfNew(n);
+        }
+      }
+
+      if (best.idx !== current) { path.push({ from: current, to: best.idx, layer: 0 }); current = best.idx; }
+      path.push({ from: current, to: "query", layer: 0 });
+      return path;
+    }
+
+    // ======================
+    // Traversal control
+    // ======================
+    function startTraversal() {
+      if (topLayerSelectedNodeIndex === null || topLayerSelectedNodeIndex === undefined) {
+        updateInfo("Pilih node entry (layer atas) dulu sebelum mulai traversal.");
+        return;
+      }
+      if (!queryPosition) {
+        updateInfo("Tentukan posisi query (Q) pada layer dasar terlebih dahulu.");
+        return;
+      }
+
+      traversalPath = computeTraversalPath(topLayerSelectedNodeIndex, queryPosition);
+      if (!traversalPath || traversalPath.length === 0) {
+        updateInfo("Gagal membuat traversal path — periksa jaringan atau node entry.");
+        traversalRunning = false;
+        updateButtons();
+        return;
+      }
+
+      traversalStep = 0;
+      traversalRunning = true;
+      clearOutline();
+      updateInfo(`Traversal dihitung: ${traversalPath.length} langkah. Klik "Mulai Traversal" untuk maju langkah.`);
+
+      // ketika traversal dimulai untuk pertama kali, nonaktifkan set query & entry
+      if (!traversalStarted) {
+        traversalStarted = true;
+        traversalReachedQuery = false;
+        // setelah set flag, updateButtons akan men-disable view2D & viewTopLayer
+        updateButtons();
+      }
+    }
+
+    function advanceTraversalStep() {
+      if (!traversalRunning || traversalStep >= traversalPath.length) {
+        updateInfo("Traversal selesai. Tidak ada langkah lagi.");
+        clearOutline();
+        traversalRunning = false;
+        updateButtons();
+        return;
+      }
+
+      const step = traversalPath[traversalStep];
+      traversalStep++;
+
+      clearOutline();
+
+      if (step.to === "query") {
+        const y = -0.5 * FIXED_CUBE_HEIGHT + 0.5 * layerGap;
+        createOutlineAt(queryPosition.x, y, queryPosition.y);
+        updateInfo(`Langkah ${traversalStep}/${traversalPath.length} → mengunjungi query (posisi target).`);
+        traversalReachedQuery = true; // block views until reset
+      } else {
+        const nodeMesh = nodeGroup.children.find(n => n.userData && n.userData.idx === step.to && n.userData.layer === step.layer && n.type === "Mesh");
+        if (nodeMesh) {
+          const pos = nodeMesh.position;
+          createOutlineAt(pos.x, pos.y, pos.z);
+          updateInfo(`Langkah ${traversalStep}/${traversalPath.length} → mengunjungi node ${step.to} (layer ${step.layer}).`);
+        } else {
+          const p = basePositions[step.to];
+          const y = -0.5 * FIXED_CUBE_HEIGHT + (step.layer + 0.5) * layerGap;
+          createOutlineAt(p.x, y, p.y);
+          updateInfo(`Langkah ${traversalStep}/${traversalPath.length} → mengunjungi node ${step.to} (layer ${step.layer}) [fallback].`);
+        }
+      }
+
+      if (traversalStep >= traversalPath.length) traversalRunning = false;
+      updateButtons();
+    }
+
+    // ======================
+    // UI helpers & events
+    // ======================
+    function checkTraversalReady() {
+      const btn = document.getElementById("startTraversal");
+      btn.disabled = !(topLayerSelectedNodeIndex !== null && queryPosition !== null && networkBuilt && !isTraversalAtQuery());
+      updateButtons();
+    }
+
+    function addEvents() {
+      window.addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      const el = renderer.domElement;
+      el.addEventListener('contextmenu', e => e.preventDefault());
+
+      let isPointerDown = false;
+      let lastX = 0, lastY = 0;
+      el.addEventListener('mousedown', e => {
+        if (e.button === 0) { isPointerDown = true; lastX = e.clientX; lastY = e.clientY; document.body.classList.add('grabbing'); }
+      });
+      ['mouseup','mouseleave'].forEach(evt => el.addEventListener(evt, () => { isPointerDown = false; document.body.classList.remove('grabbing'); }));
+      el.addEventListener('mousemove', (e) => {
+        if (!isPointerDown) return;
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        lastX = e.clientX; lastY = e.clientY;
+        theta -= dx * ROTATION_SPEED;
+        phi   -= dy * ROTATION_SPEED;
+        phi = Math.max(0.05, Math.min(Math.PI - 0.05, phi));
+        updateCamera();
+      });
+
+      el.addEventListener('wheel', e => {
+        e.preventDefault();
+        const delta = Math.sign(e.deltaY);
+        radius = Math.max(1.5, Math.min(20, radius + delta * 0.6));
+        updateCamera();
+      }, { passive:false });
+
+      window.addEventListener('keydown', e => {
+        if (e.key.toLowerCase() === 'r') {
+          theta = Math.PI/2; phi = Math.PI/3; radius = 6; updateCamera();
+        }
+      });
+
+      document.getElementById('generateNodes').addEventListener('click', () => {
+        generateBaseNodes();
+        updateButtons();
+      });
+
+      document.getElementById('buildLayer').addEventListener('click', () => {
+        buildNextLayer();
+        updateButtons();
+      });
+
+      document.getElementById('buildNetwork').addEventListener('click', () => {
+        buildNetwork();
+        updateButtons();
+      });
+
+      document.getElementById("view2D").addEventListener("click", () => {
+        if (!document.getElementById("view2D").disabled) show2DLayer();
+      });
+
+      document.getElementById("viewTopLayer").addEventListener("click", () => {
+        if (!document.getElementById("viewTopLayer").disabled) showTopLayer2D();
+      });
+
+      document.getElementById("startTraversal").addEventListener("click", () => {
+        if (topLayerSelectedNodeIndex === null || !queryPosition) {
+          alert("Tentukan node entry (layer atas) dan query node (layer bawah) terlebih dahulu!");
+          return;
+        }
+        if (!traversalRunning) {
+          startTraversal();
+          // jalankan langkah pertama untuk feedback
+          advanceTraversalStep();
+        } else {
+          advanceTraversalStep();
+        }
+        updateButtons();
+      });
+
+      // ===== MODIFIKASI handler Reset Traversal =====
+      document.getElementById("resetTraversal").addEventListener("click", () => {
+        // reset traversal state
+        traversalRunning = false;
+        traversalStep = 0;
+        traversalPath = [];
+        
+        // Hapus marker query dari nodeGroup (jika ada)
+        for (let i = nodeGroup.children.length - 1; i >= 0; i--) {
+          const child = nodeGroup.children[i];
+          if (child && child.userData && child.userData.idx === "query") {
+            nodeGroup.remove(child);
+            try { child.geometry.dispose(); } catch(e) {}
+            try { if (child.material) child.material.dispose(); } catch(e) {}
+          }
+        }
+        
+        // Hapus outline/highlight 3D yang mungkin masih ada
+        clearOutline();
+        
+        // Matikan flag entryHighlighted agar rebuild tidak memulihkan outline
+        entryHighlighted = false;
+        
+        // Batalkan juga selection top-layer agar overlay 2D tidak menggambar highlight visual
+        topLayerSelectedNodeIndex = null;
+        
+        // Hapus posisi query di state supaya Q tidak muncul kembali
+        queryPosition = null;
+        
+        // Jika overlay 2D sedang tampil, hapus canvas dan tombol "Kembali ke Mode 3D"
+        const canvasTop = document.getElementById("canvasTopLayer");
+        if (canvasTop) {
+          canvasTop.remove();
+        }
+        // juga hapus canvas 2D base-layer jika ada
+        const canvasBase = document.getElementById("canvas2D");
+        if (canvasBase) canvasBase.remove();
+        
+        // Hapus tombol "Kembali ke Mode 3D" yang dibuat dinamis (cari berdasarkan teks)
+        document.querySelectorAll('button').forEach(btn => {
+          if (btn.textContent && btn.textContent.trim() === "Kembali ke Mode 3D") {
+            try { btn.remove(); } catch (e) {}
+          }
+        });
+        
+        // Rebuild supaya nodeGroup konsisten (tidak menampilkan Q atau outline)
+        rebuildNodeGroup();
+        
+        // Reset flags traversal yang memblokir tombol set-query/set-entry
+        traversalReachedQuery = false;
+        traversalStarted = false;
+        
+        updateInfo("Traversal direset. Silakan set ulang entry point dan node query untuk memulai kembal traversal.");
+        updateButtons();
+        checkTraversalReady();
+      });
+    }
+
+    // ======================
+    // 2D top-layer & base-layer views
+    // ======================
+    function showTopLayer2D() {
+      if (promotedLayers.length === 0) { alert("Belum ada layer yang dibangun!"); return; }
+
+      renderer.domElement.style.display = "none";
+      document.getElementById("control-panel").style.display = "none";
+
+      const canvas2D = document.createElement("canvas");
+      canvas2D.id = "canvasTopLayer";
+      canvas2D.width = innerWidth;
+      canvas2D.height = innerHeight;
+      canvas2D.style.background = "#f0f8ff";
+      document.body.appendChild(canvas2D);
+      const ctx = canvas2D.getContext("2d");
+
+      const nodes = promotedLayers[promotedLayers.length - 1];
+      const cx = canvas2D.width / 2;
+      const cy = canvas2D.height / 2;
+      const radius = 18;
+      const hoverOffset = 4;
+      let hoverNodeIndex = null;
+
+      const boxHalfWorld = LAYER_SIZE * 0.5;
+      const boxHalfPx = boxHalfWorld * SCALE;
+
+      function drawTopLayer() {
+        ctx.clearRect(0,0,canvas2D.width, canvas2D.height);
+        ctx.strokeStyle = hexToCss(BORDER_COLOR); ctx.lineWidth = 3;
+        ctx.strokeRect(cx - boxHalfPx, cy - boxHalfPx, boxHalfPx * 2, boxHalfPx * 2);
+
+        const yLayer = -0.5 * FIXED_CUBE_HEIGHT + (promotedLayers.length - 1 + 0.5) * layerGap;
+        if (networkGroup.children.length > 0) {
+          ctx.strokeStyle = "#004488"; ctx.lineWidth = 2; ctx.beginPath();
+          networkGroup.children.forEach(line => {
+            const pos = line.geometry.attributes.position.array;
+            if (Math.abs(pos[1] - yLayer) < EPSILON && Math.abs(pos[4] - yLayer) < EPSILON) {
+              const x1 = cx + pos[0] * SCALE, y1 = cy + pos[2] * SCALE;
+              const x2 = cx + pos[3] * SCALE, y2 = cy + pos[5] * SCALE;
+              ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+            }
+          });
+          ctx.stroke();
+        }
+
+        nodes.forEach(idx => {
+          const p = basePositions[idx];
+          const x = cx + p.x * SCALE;
+          const y = cy + p.y * SCALE;
+          const color = "#" + colorPalette[idx % colorPalette.length].toString(16).padStart(6, '0');
+
+          ctx.beginPath(); ctx.arc(x,y,radius,0,Math.PI*2); ctx.fillStyle = color; ctx.fill();
+          ctx.strokeStyle = "#003366"; ctx.stroke();
+
+          ctx.font = "bold 14px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.strokeText(idx.toString(), x, y);
+          ctx.fillStyle = "#ffffff"; ctx.fillText(idx.toString(), x, y);
+
+          if (hoverNodeIndex === idx) {
+            ctx.beginPath(); ctx.arc(x,y,radius+hoverOffset,0,Math.PI*2); ctx.strokeStyle = "rgba(255,0,0,0.8)"; ctx.lineWidth = 3; ctx.stroke();
+          }
+          if (topLayerSelectedNodeIndex === idx) {
+            ctx.beginPath(); ctx.arc(x,y,radius+hoverOffset+2,0,Math.PI*2); ctx.strokeStyle = "rgba(255,0,0,1)"; ctx.lineWidth = 3; ctx.stroke();
+          }
+        });
+
+        requestAnimationFrame(drawTopLayer);
+      }
+
+      drawTopLayer();
+
+      canvas2D.addEventListener("mousemove", (e) => {
+        const rect = canvas2D.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        hoverNodeIndex = null;
+        nodes.forEach(idx => {
+          const p = basePositions[idx];
+          const x = cx + p.x * SCALE, y = cy + p.y * SCALE;
+          const dist = Math.hypot(mx - x, my - y);
+          if (dist <= radius + hoverOffset) hoverNodeIndex = idx;
+        });
+      });
+
+      canvas2D.addEventListener("click", () => {
+        if (hoverNodeIndex !== null) {
+          topLayerSelectedNodeIndex = hoverNodeIndex;
+          highlightEntryNode();
+          checkTraversalReady();
+        }
+      });
+
+      canvas2D.addEventListener("mousedown", e => {
+        const rect = canvas2D.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        nodes.forEach(idx => {
+          const pos = basePositions[idx];
+          const x = cx + pos.x * SCALE, y = cy + pos.y * SCALE;
+          const dist = Math.hypot(mx - x, my - y);
+          if (dist < radius) {
+            updateInfo(`Node ${idx} dipilih (preview).`);
+          }
+        });
+      });
+
+      const backBtn = document.createElement("button");
+      backBtn.textContent = "Kembali ke Mode 3D";
+      backBtn.style.position = "absolute"; backBtn.style.top = "20px"; backBtn.style.left = "20px";
+      backBtn.style.padding = "8px 12px"; backBtn.style.background = "#1e90ff"; backBtn.style.color = "white";
+      backBtn.style.border = "none"; backBtn.style.borderRadius = "8px"; backBtn.style.cursor = "pointer";
+      document.body.appendChild(backBtn);
+
+      backBtn.addEventListener("click", () => {
+        canvas2D.remove(); backBtn.remove(); renderer.domElement.style.display = "block"; document.getElementById("control-panel").style.display = "block";
+        rebuildNodeGroup(); resetSidebarTo3D();
+        updateButtons();
+      });
+    }
+
+    function show2DLayer() {
+      if (promotedLayers.length === 0) { alert("Belum ada layer pertama!"); return; }
+
+      renderer.domElement.style.display = "none";
+      document.getElementById("control-panel").style.display = "none";
+
+      const canvas2D = document.createElement("canvas");
+      canvas2D.id = "canvas2D";
+      canvas2D.width = innerWidth;
+      canvas2D.height = innerHeight;
+      canvas2D.style.background = "#f0f8ff";
+      document.body.appendChild(canvas2D);
+      const ctx = canvas2D.getContext("2d");
+
+      const nodes = promotedLayers[0];
+      const cx = canvas2D.width / 2, cy = canvas2D.height / 2, radius = 18;
+      let hoverPos = null;
+      const boxHalfPx = (LAYER_SIZE * 0.5) * SCALE;
+
+      function drawLayer1() {
+        ctx.clearRect(0,0,canvas2D.width, canvas2D.height);
+        ctx.strokeStyle = hexToCss(BORDER_COLOR); ctx.lineWidth = 3;
+        ctx.strokeRect(cx - boxHalfPx, cy - boxHalfPx, boxHalfPx * 2, boxHalfPx * 2);
+
+        const yLayer = -0.5 * FIXED_CUBE_HEIGHT + 0.5 * layerGap;
+        if (networkGroup.children.length > 0) {
+          ctx.strokeStyle = "#004488"; ctx.lineWidth = 2; ctx.beginPath();
+          networkGroup.children.forEach(line=>{
+            const pos = line.geometry.attributes.position.array;
+            if (Math.abs(pos[1] - yLayer) < EPSILON && Math.abs(pos[4] - yLayer) < EPSILON) {
+              const x1 = cx + pos[0] * SCALE, y1 = cy + pos[2] * SCALE;
+              const x2 = cx + pos[3] * SCALE, y2 = cy + pos[5] * SCALE;
+              ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+            }
+          });
+          ctx.stroke();
+        }
+
+        nodes.forEach(idx=>{
+          const p = basePositions[idx];
+          const x = cx + p.x * SCALE, y = cy + p.y * SCALE;
+          const color = "#" + colorPalette[idx % colorPalette.length].toString(16).padStart(6, '0');
+          ctx.beginPath(); ctx.arc(x,y,radius,0,Math.PI*2); ctx.fillStyle = color; ctx.fill();
+          ctx.strokeStyle = "#003366"; ctx.stroke();
+          ctx.fillStyle = "#ffffff"; ctx.font = "bold 14px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText(idx.toString(), x, y);
+        });
+
+        if (queryPosition) {
+          ctx.beginPath(); ctx.arc(cx + queryPosition.x * SCALE, cy + queryPosition.y * SCALE, radius, 0, Math.PI*2);
+          ctx.fillStyle = "#000000"; ctx.fill(); ctx.strokeStyle = "#003366"; ctx.stroke();
+          ctx.fillStyle = "#ffffff"; ctx.font = "bold 14px Arial"; ctx.fillText("Q", cx + queryPosition.x * SCALE, cy + queryPosition.y * SCALE);
+        }
+
+        if (hoverPos) {
+          ctx.beginPath(); ctx.arc(cx + hoverPos.x * SCALE, cy + hoverPos.y * SCALE, radius, 0, Math.PI*2); ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.fill();
+          ctx.strokeStyle = "rgba(0,0,0,0.8)"; ctx.stroke();
+        }
+      }
+
+      drawLayer1();
+
+      function inBounds(x,y) { const LIMIT = LAYER_SIZE * 0.5; return Math.abs(x) <= LIMIT && Math.abs(y) <= LIMIT; }
+
+      canvas2D.addEventListener("mousemove", (e) => {
+        const rect = canvas2D.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        const qx = (mx - cx) / SCALE, qy = (my - cy) / SCALE;
+        hoverPos = inBounds(qx,qy) ? new THREE.Vector2(qx,qy) : null;
+        drawLayer1();
+      });
+
+      canvas2D.addEventListener("click", () => {
+        if (hoverPos && inBounds(hoverPos.x, hoverPos.y)) {
+          queryPosition = hoverPos.clone();
+          hoverPos = null;
+          drawLayer1();
+          checkTraversalReady();
+          updateButtons();
+        }
+      });
+
+      const backBtn = document.createElement("button");
+      backBtn.textContent = "Kembali ke Mode 3D";
+      backBtn.style.position = "absolute"; backBtn.style.top = "20px"; backBtn.style.left = "20px";
+      backBtn.style.padding = "8px 12px"; backBtn.style.background = "#1e90ff"; backBtn.style.color = "white";
+      backBtn.style.border = "none"; backBtn.style.borderRadius = "8px"; backBtn.style.cursor = "pointer";
+      document.body.appendChild(backBtn);
+
+      backBtn.addEventListener("click", () => {
+        canvas2D.remove(); backBtn.remove(); renderer.domElement.style.display = "block"; document.getElementById("control-panel").style.display = "block";
+        rebuildNodeGroup(); resetSidebarTo3D();
+        updateButtons();
+      });
+    }
+
+    // ======================
+    // Animation loop & boot
+    // ======================
+    function animate() {
+      requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    }
+
+    function resetSidebarTo3D() {
+      const panel = document.getElementById("control-panel");
+      panel.style.position = "absolute";
+      panel.style.top = "30px";
+      panel.style.left = "20px";
+      panel.style.width = "180px";
+      panel.style.display = "flex";
+      panel.style.flexDirection = "column";
+      panel.style.alignItems = "stretch";
+      panel.style.background = "rgba(255, 255, 255, 0.35)";
+      panel.style.padding = "12px";
+      panel.style.borderRadius = "12px";
+      panel.style.backdropFilter = "blur(6px)";
+      panel.style.fontFamily = "sans-serif";
+      panel.style.fontSize = "14px";
+      panel.style.color = "#003366";
+      panel.style.boxShadow = "0 0 10px rgba(255, 255, 255, 0.4)";
+      panel.style.gap = "8px";
+    }
+
+    window.onload = () => { init(); animate(); updateButtons(); updateInfo("Klik tombol 'Buat 14 Node Acak' untuk memulai."); };
+  </script>
+</body>
+</html>
