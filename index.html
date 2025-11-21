@@ -82,6 +82,7 @@
     <button id="view2D" disabled>Set Query di Base Layer</button>
     <button id="startTraversal" disabled>Mulai Traversal</button>
     <button id="resetTraversal" disabled>Reset Traversal</button>
+    <button id="toggleTraversalTrail" disabled>Tampilkan Jejak Traversal</button>
     <div id="info">Informasi : -</div>
   </div>
 
@@ -148,9 +149,13 @@
     const MAX_LAYER = 5;
     let networkBuilt = false;
 
-    // New flags
+    // New flags for traversal trail toggle
     let traversalReachedQuery = false; // true when traversal reached query
     let traversalStarted = false;      // true once traversal was started at least once
+
+    // Toggle state
+    let traversalTrailOn = false;
+    let savedNetworkVisibility = null;
 
     // ======================
     // Utility & camera
@@ -180,6 +185,7 @@
       const btnViewTop = document.getElementById("viewTopLayer");
       const btnStart = document.getElementById("startTraversal");
       const btnReset = document.getElementById("resetTraversal");
+      const btnToggleTrail = document.getElementById("toggleTraversalTrail");
 
       // generate selalu aktif
       btnGenerate.disabled = false;
@@ -191,7 +197,6 @@
       btnBuildNetwork.disabled = !(layerCount >= MAX_LAYER && !networkBuilt);
 
       // view2D & viewTopLayer aktif hanya bila network sudah dibangun AND traversal belum membekukan pemilihan
-      // pembekuan terjadi saat traversalStarted true (ketika user mulai traversal) atau traversalReachedQuery true
       const viewsAllowed = networkBuilt && !traversalStarted && !traversalReachedQuery;
       btnView2D.disabled = !viewsAllowed;
       btnViewTop.disabled = !viewsAllowed;
@@ -203,6 +208,13 @@
 
       // resetTraversal aktif bila traversal pernah dihitung atau sedang berjalan atau traversalReachedQuery true
       btnReset.disabled = !( (traversalPath && traversalPath.length > 0) || traversalRunning || traversalReachedQuery || traversalStarted );
+
+      // Toggle tombol traversal trail hanya aktif bila traversal mencapai akhir (sudah sampai query)
+      const traversalAtEnd = isTraversalAtQuery() || traversalReachedQuery;
+      if (btnToggleTrail) {
+        btnToggleTrail.disabled = !traversalAtEnd;
+        btnToggleTrail.textContent = traversalTrailOn ? "Sembunyikan Jejak Traversal" : "Tampilkan Jejak Traversal";
+      }
     }
 
     function updateInfo(msg) {
@@ -324,6 +336,8 @@
       networkBuilt = false;
       traversalReachedQuery = false;
       traversalStarted = false;
+      traversalTrailOn = false;
+      savedNetworkVisibility = null;
 
       document.getElementById("layerCount").textContent = 0;
 
@@ -498,18 +512,18 @@
       for (let i = 0; i < promotedLayers.length; i++) {
         const y = -0.5 * height + (i + 0.5) * layerGap;
         const nodes = promotedLayers[i];
-        const K = (i === 0) ? Mmax : Mmax0;
+        let K = (i === 0) ? Mmax : Mmax0;
+        K = Math.max(1, Math.min(K, Math.max(0, nodes.length - 1))); // minimal 1 jika ada >1 node
         const layerColor = new THREE.Color(layerColors[i % layerColors.length]);
-
+        
         for (let a = 0; a < nodes.length; a++) {
           const idxA = nodes[a];
           const posA = basePositions[idxA];
-          const neighbors = nodes
-            .filter(idxB => idxB !== idxA)
+          const candidates = nodes.filter(idxB => idxB !== idxA)
             .map(idxB => ({ idx: idxB, dist: Math.hypot(basePositions[idxB].x - posA.x, basePositions[idxB].y - posA.y) }))
-            .sort((a, b) => a.dist - b.dist)
-            .slice(0, K);
-
+            .sort((a,b) => a.dist - b.dist);
+          // slice aman; jika candidates.length < K maka slice mengambil semua
+          const neighbors = candidates.slice(0, K);
           neighbors.forEach(({ idx }) => {
             const posB = basePositions[idx];
             const A = new THREE.Vector3(posA.x, y, posA.y);
@@ -679,7 +693,6 @@
       if (!traversalStarted) {
         traversalStarted = true;
         traversalReachedQuery = false;
-        // setelah set flag, updateButtons akan men-disable view2D & viewTopLayer
         updateButtons();
       }
     }
@@ -717,9 +730,73 @@
         }
       }
 
-      if (traversalStep >= traversalPath.length) traversalRunning = false;
+      if (traversalStep >= traversalPath.length) {
+        traversalRunning = false;
+        // when traversal done, enable toggle via updateButtons
+      }
       updateButtons();
     }
+
+    // ======================
+    // Traversal trail utilities
+    // ======================
+function getTraversalEdgeKeys() {
+  const keys = new Set();
+  if (!traversalPath || traversalPath.length === 0) return keys;
+  for (const step of traversalPath) {
+    if (step.to === "query") continue;
+
+    // Horizontal edge (dua node berbeda pada layer tertentu)
+    if (typeof step.from === "number" && typeof step.to === "number" && step.from !== step.to) {
+      const layer = step.layer;
+      const a = Math.min(step.from, step.to), b = Math.max(step.from, step.to);
+      keys.add(`${layer}|h|${a}|${b}`);
+    }
+
+    // Vertical descent: same node index but moving to lower layer
+    if (typeof step.from === "number" && typeof step.to === "number" && step.from === step.to) {
+      // step.layer dalam konstruksi path Anda menunjuk layer target/lower; gunakan itu
+      const lowerLayer = step.layer;
+      const nodeIdx = step.from;
+      keys.add(`${lowerLayer}|v|${nodeIdx}`);
+    }
+  }
+  return keys;
+}
+
+
+function toggleTraversalTrail(showOnlyTrail) {
+  traversalTrailOn = !!showOnlyTrail;
+  if (savedNetworkVisibility === null) {
+    savedNetworkVisibility = networkGroup.children.map(l => l.visible);
+  }
+
+  const trailKeys = getTraversalEdgeKeys();
+
+  networkGroup.children.forEach((line, i) => {
+    if (!line.userData) return;
+    const layer = line.userData.layer;
+    const from = line.userData.from;
+    const to = line.userData.to;
+
+    // Vertical connectors stored as from === to in buildNetwork
+    if (from === to) {
+      const key = `${layer}|v|${from}`; // vertical key anchored at lower layer
+      line.visible = showOnlyTrail ? trailKeys.has(key) : (savedNetworkVisibility ? savedNetworkVisibility[i] : true);
+      return;
+    }
+
+    // Horizontal edge
+    const a = Math.min(from, to), b = Math.max(from, to);
+    const key = `${layer}|h|${a}|${b}`;
+    line.visible = showOnlyTrail ? trailKeys.has(key) : (savedNetworkVisibility ? savedNetworkVisibility[i] : true);
+  });
+
+  if (showOnlyTrail) updateInfo("Menampilkan hanya jejak traversal (edges yang dilewati).");
+  else { updateInfo("Kembali ke tampilan jaringan penuh."); savedNetworkVisibility = null; }
+  updateButtons();
+}
+
 
     // ======================
     // UI helpers & events
@@ -813,7 +890,7 @@
         traversalRunning = false;
         traversalStep = 0;
         traversalPath = [];
-        
+
         // Hapus marker query dari nodeGroup (jika ada)
         for (let i = nodeGroup.children.length - 1; i >= 0; i--) {
           const child = nodeGroup.children[i];
@@ -823,46 +900,65 @@
             try { if (child.material) child.material.dispose(); } catch(e) {}
           }
         }
-        
+
         // Hapus outline/highlight 3D yang mungkin masih ada
         clearOutline();
-        
+
         // Matikan flag entryHighlighted agar rebuild tidak memulihkan outline
         entryHighlighted = false;
-        
+
         // Batalkan juga selection top-layer agar overlay 2D tidak menggambar highlight visual
         topLayerSelectedNodeIndex = null;
-        
+
         // Hapus posisi query di state supaya Q tidak muncul kembali
         queryPosition = null;
-        
+
         // Jika overlay 2D sedang tampil, hapus canvas dan tombol "Kembali ke Mode 3D"
         const canvasTop = document.getElementById("canvasTopLayer");
         if (canvasTop) {
           canvasTop.remove();
         }
-        // juga hapus canvas 2D base-layer jika ada
         const canvasBase = document.getElementById("canvas2D");
         if (canvasBase) canvasBase.remove();
-        
+
         // Hapus tombol "Kembali ke Mode 3D" yang dibuat dinamis (cari berdasarkan teks)
         document.querySelectorAll('button').forEach(btn => {
           if (btn.textContent && btn.textContent.trim() === "Kembali ke Mode 3D") {
             try { btn.remove(); } catch (e) {}
           }
         });
-        
+
         // Rebuild supaya nodeGroup konsisten (tidak menampilkan Q atau outline)
         rebuildNodeGroup();
-        
+
         // Reset flags traversal yang memblokir tombol set-query/set-entry
         traversalReachedQuery = false;
         traversalStarted = false;
-        
+
+        // Jika traversal trail aktif, matikan dan kembalikan network visibility
+        if (traversalTrailOn) {
+          toggleTraversalTrail(false);
+        }
+        traversalTrailOn = false;
+        savedNetworkVisibility = null;
+
         updateInfo("Traversal direset. Silakan set ulang entry point dan node query untuk memulai kembal traversal.");
         updateButtons();
         checkTraversalReady();
       });
+
+      // Listener toggle traversal trail
+      const btnToggle = document.getElementById("toggleTraversalTrail");
+      if (btnToggle) {
+        btnToggle.addEventListener("click", () => {
+          const allowed = isTraversalAtQuery() || traversalReachedQuery;
+          if (!allowed) {
+            updateInfo("Jejak hanya bisa ditampilkan setelah traversal mencapai langkah terakhir.");
+            return;
+          }
+          toggleTraversalTrail(!traversalTrailOn);
+        });
+      }
     }
 
     // ======================
